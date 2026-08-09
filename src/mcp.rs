@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Router, extract::State};
+use axum::{Router, extract::State, middleware};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -123,7 +123,13 @@ pub async fn serve_http(
 
 fn http_router(state: HttpState) -> Router {
     Router::new()
-        .route("/mcp", post(http_post).get(http_get).delete(http_get))
+        .route(
+            "/mcp",
+            post(http_post)
+                .get(http_get)
+                .delete(http_get)
+                .options(http_options),
+        )
         .route(
             "/.well-known/oauth-protected-resource",
             get(oauth_protected_resource),
@@ -133,6 +139,42 @@ fn http_router(state: HttpState) -> Router {
             get(oauth_protected_resource),
         )
         .with_state(state)
+        .layer(middleware::from_fn(add_cors_headers))
+}
+
+async fn add_cors_headers(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .filter(|_| has_valid_origin(request.headers()))
+        .cloned();
+    let mut response = next.run(request).await;
+    if let Some(origin) = origin {
+        let headers = response.headers_mut();
+        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
+    response
+}
+
+async fn http_options(headers: HeaderMap) -> Response {
+    if !has_valid_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "Origin is not allowed").into_response();
+    }
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                "POST, GET, DELETE, OPTIONS",
+            ),
+            (
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "Authorization, Content-Type, Accept, MCP-Protocol-Version",
+            ),
+        ],
+    )
+        .into_response()
 }
 
 async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Response {
@@ -159,7 +201,11 @@ async fn http_post(State(state): State<HttpState>, headers: HeaderMap, body: Byt
         )
             .into_response();
     }
+    if !accepts_json(&headers) {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
             "Accept must include application/json",
+        )
             .into_response();
     }
 
@@ -372,17 +418,14 @@ fn accepts_json(headers: &HeaderMap) -> bool {
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
     else {
-        return false;
+        return true;
     };
-    let accepts = |expected: &str| {
-        value.split(',').any(|item| {
-            item.trim()
-                .split(';')
-                .next()
-                .is_some_and(|mime| mime.eq_ignore_ascii_case(expected) || mime == "*/*")
-        })
-    };
-    accepts("application/json") && accepts("text/event-stream")
+    value.split(',').any(|item| {
+        item.trim()
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json") || mime == "*/*")
+    })
 }
 
 fn json_response(value: Value) -> Response {
@@ -1132,6 +1175,57 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_accepts_json_only_or_missing_accept() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(header::ACCEPT, "application/json".parse().unwrap());
+        let response = http_post(
+            http_state(None),
+            headers,
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        let response = http_post(
+            http_state(None),
+            headers,
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut headers = http_headers();
+        headers.insert(header::ACCEPT, "text/event-stream".parse().unwrap());
+        let response = http_post(
+            http_state(None),
+            headers,
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn http_handles_localhost_cors_preflight() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "http://localhost:3000".parse().unwrap());
+        let response = http_options(headers).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+            "POST, GET, DELETE, OPTIONS"
+        );
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "Authorization, Content-Type, Accept, MCP-Protocol-Version"
+        );
     }
 
     #[tokio::test]
